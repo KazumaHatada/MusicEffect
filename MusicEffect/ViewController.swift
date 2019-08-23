@@ -15,85 +15,247 @@ class ViewController: UIViewController, MPMediaPickerControllerDelegate {
     @IBOutlet weak var vImageView: UIImageView!
     @IBOutlet weak var lArtist: UILabel!
     @IBOutlet weak var lSong: UILabel!
-    @IBOutlet weak var lAlbum: UILabel!
-    @IBOutlet weak var lSongStatus: UILabel!
-    @IBOutlet weak var lVolume: UILabel!
+
+    @IBOutlet weak var osSeekBar: TappableSlider!
+    @IBOutlet weak var lNowTime: UILabel!
+    @IBOutlet weak var lMaxTime: UILabel!
+    
     @IBOutlet weak var bStart: UIButton!
     @IBOutlet weak var bPause: UIButton!
     @IBOutlet weak var bStop: UIButton!
+    
+    @IBOutlet weak var lVolume: UILabel!
+    
     @IBOutlet weak var bPitchFlat: UIButton!
     @IBOutlet weak var bPitchDefault: UIButton!
     @IBOutlet weak var bPitchHash: UIButton!
     @IBOutlet weak var lPitch: UILabel!
     
+    //------------------------------------------------------------------
+    let player = AVAudioPlayerNode()
+    let engine = AVAudioEngine()
+    let mpc = MPMusicPlayerController.systemMusicPlayer
+    let timePitch = AVAudioUnitTimePitch()
+    
+    var currentSong:MPMediaItem?
+    var currentFile:AVAudioFile?
+    
+    // 再生スライドバー用のタイマー。１秒ごとにupdateSlider()を実行する
+    var sliderTimer: Timer?
+    // シーク機能に必要
+    var currentSampleRate: Double = 0.0
+    var currentLength: Double = 0.0
+    var currentTotalSec: Double = 0.0
+    var offset = 0.0
+    //------------------------------------------------------------------
+
+    /// -------------------------------------------- MediaPicker関連 ----------------------------------------
+    /// MediaPicker起動
     @IBAction func bChoose(_ sender: UIButton) {
         // MPMediaPickerControllerのインスタンスを作成
         let picker = MPMediaPickerController()
-        // ピッカーのデリゲートを設定
         picker.delegate = self
+
         // 複数選択を不可にする。（trueにすると、複数選択できる）
         picker.allowsPickingMultipleItems = false
-        // ピッカーを表示する
+        // 再生できない曲を非表示にする
+        picker.showsCloudItems = false
+        picker.showsItemsWithProtectedAssets = false
+
         present(picker, animated: true, completion: nil)
     }
 
-    /// メディアアイテムピッカーでアイテムを選択完了したときに呼び出される
+    /// MediaPickerでアイテムを選択完了したときに呼び出される
     func mediaPicker(_ mediaPicker: MPMediaPickerController, didPickMediaItems mediaItemCollection: MPMediaItemCollection) {
         
         // 選択した曲から最初の曲の情報を表示
         if let mi = mediaItemCollection.items.first {
             prepareEngine(mi)
             currentSong = mi
-            updateSongInformationUI(mi)
+            updateUI(mi)
         }
         
-        // ピッカーを閉じ、破棄する
         dismiss(animated: true, completion: nil)
+        
+        // タイマーが動いてたら止める
+        sliderTimer?.invalidate()
     }
     
     /// 選択がキャンセルされた場合に呼ばれる
     func mediaPickerDidCancel(_ mediaPicker: MPMediaPickerController) {
-        // ピッカーを閉じ、破棄する
         dismiss(animated: true, completion: nil)
     }
     
+    /// 再生中の曲が変更になったときに呼ばれる？呼ばれない？
+    @objc func nowPlayingItemChanged(notification: NSNotification) {
+        print("Item has been changed")
+        if let mediaItem = mpc.nowPlayingItem {
+            updateUI(mediaItem)
+        }
+    }
+    
 
+    /// ---------------------------- 曲がセットされた時にAvAudioEngineを作成する --------------------------------
+    func prepareEngine(_ mediaItem: MPMediaItem?) {
+        print("初期処理開始。。")
+        
+        if mediaItem == nil {
+            print("曲を選んでね")
+            updateUIButtonEnable(false)
+            
+        } else if let fileURL = mediaItem?.assetURL {
+            if let file = try? AVAudioFile(forReading: fileURL) {
+                currentFile = file
+                
+                // ボリューム初期化
+                player.volume = 0.5
+                engine.attach(player)
+                
+                // ピッチ初期化
+                changePitch(0)
+                timePitch.rate = 1.0
+                engine.attach(timePitch)
+                
+                // engineに曲とピッチ情報をセット
+                engine.connect(player, to: timePitch, format: file.processingFormat)
+                engine.connect(timePitch, to: engine.mainMixerNode, format: file.processingFormat)
+                
+                // スケジューリング
+                player.scheduleFile(file, at: nil, completionHandler: nil)
+                
+                // エンジン起動
+                try? engine.start()
+                
+                // スライダー初期化
+                initializeSlider(file)
+                
+                // ボタン活性化
+                updateUIButtonEnable(true)
+                
+                print("準備完了")
+            } else {
+                print("音楽ファイルがおかしい？")
+                updateUIButtonEnable(false)
+            }
+            
+        } else {
+            print("クラウド上のアイテムやApple Musicから「マイミュージックに追加」したアイテムは再生できません。。")
+            updateUIButtonEnable(false)
+        }
+        
+        updateUI(mediaItem)
+    }
+
+    
+    /// -------------------------------------------- シークバー関連 ----------------------------------------
+    /// スライドバーで指定された所から曲を再開（演奏中１秒ごと実行）
+    @IBAction func sSeekBar(_ sender: TappableSlider) {
+        print("SeekBar has been changed [\(sender.value)]")
+        
+        if currentFile == nil {
+            return
+        }
+        
+        // シーク位置（AVAudioFramePosition）取得
+        let newSampleTime = AVAudioFramePosition(currentSampleRate * Double(sender.value))
+        
+        // 残り時間取得（sec）
+        let leftSec = currentTotalSec - Double(sender.value)
+        // 残りフレーム数（AVAudioFrameCount）取得
+        let framesToPlay = AVAudioFrameCount(currentSampleRate * leftSec)
+
+        if framesToPlay > 100 {
+            player.stop()
+            
+            // 指定の位置から再生するようスケジューリング
+            player.scheduleSegment(currentFile!,
+                                   startingFrame: newSampleTime,
+                                   frameCount: framesToPlay,
+                                   at: nil,
+                                   completionHandler: nil
+            )
+            
+            player.play()
+        }
+/*
+        player.play(
+            at: AVAudioTime(
+                sampleTime: AVAudioFramePosition(currentSampleRate * Double(sender.value)),
+                atRate: currentSampleRate
+            )
+        )
+*/
+        // lastRenderTimeが0になってしまうので補完する
+        self.offset = Double(sender.value)
+    }
+    
+    /// 曲の再生中、１秒ごとに呼び出される
+    @objc func updateSlider(_ flg:Bool = false) {
+
+        guard let nodeTime = player.lastRenderTime else {
+            return
+        }
+
+        guard let playerTime = player.playerTime(forNodeTime: nodeTime) else {
+            return
+        }
+        
+//if flg == true {
+    print("kita  \(nodeTime.hostTime)  \(Double(playerTime.sampleTime))  \(currentSampleRate)  \(offset)")
+//}
+        
+        let currentTime = (Double(playerTime.sampleTime) / currentSampleRate) + offset
+        osSeekBar.value = Float(currentTime)
+        lNowTime.text = formatTimeString(TimeInterval(currentTime))
+
+//print("\(osSeekBar.minimumValue) - \(osSeekBar.value) - \(osSeekBar.maximumValue)")
+    }
+    
+    
+    /// -------------------------------------------- 再生・停止関連 ----------------------------------------
     @IBAction func bStart(_ sender: UIButton) {
         if player.numberOfInputs == 0 {
-            prepareEngine(currentSong) // Repeat current song
+            prepareEngine(currentSong)
         }
         player.play()
         if player.isPlaying {
-            lSongStatus.text = "演奏中だよ"
+            print("演奏中だよ")
         } else {
-            lSongStatus.text = "鳴ってないよ。。"
+            print("鳴ってないよ。。")
         }
+        
+        // スライダーのつまみを動かすタイマー開始
+        sliderTimer = Timer.scheduledTimer(timeInterval: 1, target: self, selector: #selector(ViewController.updateSlider), userInfo: nil, repeats: true)
     }
     
     
     @IBAction func bPause(_ sender: UIButton) {
         if player.isPlaying {
             player.pause()
-            lSongStatus.text = "一時停止中だよ"
+            sliderTimer?.invalidate()
+            print("一時停止中だよ")
         } else {
             player.play()
-            lSongStatus.text = "また鳴りだしたよ"
+            sliderTimer = Timer.scheduledTimer(timeInterval: 1, target: self, selector: #selector(ViewController.updateSlider), userInfo: nil, repeats: true)
+            print("また鳴りだしたよ")
         }
     }
     
     
     @IBAction func bStop(_ sender: UIButton) {
         player.stop()
-        lSongStatus.text = "止まったよ"
+        sliderTimer?.invalidate()
+        lNowTime.text = "0:00:00"
+        print("止まったよ")
     }
 
-    
+    /// -------------------------------------------- ボリューム関連 ----------------------------------------
     @IBAction func sVolumeChange(_ sender: UISlider) {
         player.volume = sender.value
         lVolume.text = String(format: "%.2f%%", player.volume * 100)
     }
     
-
+    /// ---------------------------------------------- ピッチ関連 -----------------------------------------
     @IBAction func bPitchFlat(_ sender: Any) {
         changePitch(-1)
     }
@@ -106,6 +268,7 @@ class ViewController: UIViewController, MPMediaPickerControllerDelegate {
         changePitch(1)
     }
 
+    /// ピッチ（音程）の変更を行う
     func changePitch(_ value:Int){
         switch value {
         case 1:
@@ -129,78 +292,15 @@ class ViewController: UIViewController, MPMediaPickerControllerDelegate {
         lPitch.text = pitchText
     }
 
-    
-    
-    let player = AVAudioPlayerNode()
-    let engine = AVAudioEngine()
-    let mpc = MPMusicPlayerController.systemMusicPlayer
-    let timePitch = AVAudioUnitTimePitch()
-    
-    var currentSong:MPMediaItem?
 
-    override func viewDidLoad() {
-        super.viewDidLoad()
-        // Do any additional setup after loading the view.
-        prepareEngine(nil)
-
-        // 再生中のItemが変わった時に通知を受け取る
-        let notificationCenter = NotificationCenter()
-        notificationCenter.addObserver(self, selector: #selector(type(of: self).nowPlayingItemChanged(notification:)), name: NSNotification.Name.MPMusicPlayerControllerNowPlayingItemDidChange, object: player)
-        // 通知の有効化
-        mpc.beginGeneratingPlaybackNotifications()
-    }
-
-    func prepareEngine(_ mediaItem: MPMediaItem?) {
-        lArtist.text = "--"
-        lSong.text = "--"
-        lAlbum.text = "--"
-        vImageView.backgroundColor = UIColor.gray
-        lVolume.text = String(format: "%.2f%%", 0.5 * 100)
-        lSongStatus.text = "初期処理開始。。"
-        
-        if mediaItem == nil {
-            lSongStatus.text = "曲を選んでね"
-            switchPlayerEnable(false)
-        } else if let fileURL = mediaItem?.assetURL {
-            if let file = try? AVAudioFile(forReading: fileURL) {
-                player.volume = 0.5
-                engine.attach(player)
-                
-                changePitch(0)
-                timePitch.rate = 1.0
-                engine.attach(timePitch)
-                
-                engine.connect(player, to: timePitch, format: file.processingFormat)
-                engine.connect(timePitch, to: engine.mainMixerNode, format: file.processingFormat)
-
-                player.scheduleFile(file, at: nil, completionHandler: nil)
-
-                try? engine.start()
-                
-                switchPlayerEnable(true)
-                
-                lVolume.text = String(format: "%.2f%%", player.volume * 100)
-                lSongStatus.text = "準備完了"
-            } else {
-                lSongStatus.text = "音楽ファイルがおかしい？"
-                switchPlayerEnable(false)
-            }
-        } else {
-            lSongStatus.text = "クラウド上のアイテムやApple Musicから「マイミュージックに追加」したアイテムは再生できません。。"
-            switchPlayerEnable(false)
-        }
-
-        updateSongInformationUI(mediaItem)
-    }
-
-    /// 曲情報を表示する
-    func updateSongInformationUI(_ mediaItem: MPMediaItem?) {
+    /// ---------------------------------------------- UI関連 -----------------------------------------
+    /// 画面まわりを最新化する
+    func updateUI(_ mediaItem: MPMediaItem?) {
         // 曲情報表示
         // (a ?? b は、a != nil ? a! : b を示す演算子です)
         // (aがnilの場合にはbとなります)
         lArtist.text = mediaItem?.artist ?? "--"
         lSong.text = mediaItem?.title ?? "--"
-        lAlbum.text = mediaItem?.albumTitle ?? "--"
         
         // アートワーク表示
         if let artwork = mediaItem?.artwork {
@@ -210,9 +310,29 @@ class ViewController: UIViewController, MPMediaPickerControllerDelegate {
             vImageView.image = nil
             vImageView.backgroundColor = UIColor.gray
         }
+
+        lVolume.text = String(format: "%.2f%%", player.volume * 100)
     }
 
-    func switchPlayerEnable(_ isEnable:Bool) {
+    /// スライダーだけは別関数で。。
+    func initializeSlider(_ file:AVAudioFile) {
+        currentSampleRate = file.fileFormat.sampleRate // サンプルレート(Double)
+        currentLength = Double(file.length) // 音声ファイルの総フレーム数(AVAudioFramePosition:Int64)
+        currentTotalSec = currentLength / currentSampleRate
+print("sampleRate[\(currentSampleRate)] length[\(currentLength)] totalSec[\(currentTotalSec)]")
+        
+        // 再生する音楽の長さとスライダーの長さを同期させる
+        osSeekBar.maximumValue = Float(currentTotalSec)
+        
+        osSeekBar.value = 0.0
+        offset = 0.0
+        lMaxTime.text = formatTimeString(currentTotalSec)
+        lNowTime.text = "0:00:00"
+print("osSeekBar.maximumValue [\(osSeekBar.maximumValue)]")
+    }
+
+    /// ボタンの有効無効を切り替える
+    func updateUIButtonEnable(_ isEnable:Bool) {
         bStart.isEnabled = isEnable
         bPause.isEnabled = isEnable
         bStop.isEnabled = isEnable
@@ -221,11 +341,18 @@ class ViewController: UIViewController, MPMediaPickerControllerDelegate {
         bPitchHash.isEnabled = isEnable
     }
 
-    /// 再生中の曲が変更になったときに呼ばれる
-    @objc func nowPlayingItemChanged(notification: NSNotification) {
-        if let mediaItem = mpc.nowPlayingItem {
-            updateSongInformationUI(mediaItem)
-        }
+    
+    /// ----------------------------------- ★★★★ここから呼び出される〜★★★★ -----------------------------------
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        // Do any additional setup after loading the view.
+        prepareEngine(nil)
+        
+        // 再生中のItemが変わった時に通知を受け取る
+        let notificationCenter = NotificationCenter()
+        notificationCenter.addObserver(self, selector: #selector(type(of: self).nowPlayingItemChanged(notification:)), name: NSNotification.Name.MPMusicPlayerControllerNowPlayingItemDidChange, object: player)
+        // 通知の有効化
+        mpc.beginGeneratingPlaybackNotifications()
     }
 
     deinit {
@@ -235,8 +362,6 @@ class ViewController: UIViewController, MPMediaPickerControllerDelegate {
         // ミュージックプレーヤー通知の無効化
         mpc.endGeneratingPlaybackNotifications()
     }
-
-
 
     override func didReceiveMemoryWarning() {
         super.didReceiveMemoryWarning()
@@ -308,4 +433,26 @@ extension ViewController: MPMediaPickerControllerDelegate {
     }
 }
 */
+    func formatTimeString(_ d: TimeInterval) -> String {
+        var targetTime = d
+        
+        let hour = floor(targetTime / 3600)
+        let strHour = String(format: "%d", Int(hour))
+        
+        targetTime = targetTime.truncatingRemainder(dividingBy: 3600)
+        
+        let minute = floor(targetTime / 60)
+        let strMinute = String(format: "%02d", Int(minute))
+        
+        let second = targetTime.truncatingRemainder(dividingBy: 60)
+        let strSecond = String(format: "%02d", Int(second))
+        
+        return String("\(strHour):\(strMinute):\(strSecond)")
+    }
+}
+
+class TappableSlider: UISlider {
+    override func beginTracking(_ touch: UITouch, with event: UIEvent?) -> Bool {
+        return true // どんなtouchでもスライダー調節を行う
+    }
 }
